@@ -1,7 +1,3 @@
-"""
-Train a diffusion model for recommendation
-"""
-
 import argparse
 from ast import parse
 import os
@@ -83,10 +79,12 @@ parser.add_argument('--encoder_num_epochs', type=int, default=150,
                     help="the epochs number of encoder")
 parser.add_argument('--alpha', type=float, default=1,
                     help="loss weight of encoder")
-parser.add_argument('--beta', type=float, default=1,
+parser.add_argument('--beta', type=float, default=0.4,
                     help="loss weight of decoder")
-parser.add_argument('--gema', type=float, default=1,
-                    help="loss weight of decoder")
+parser.add_argument('--gema', type=float, default=0.3,
+                    help="loss weight of surg")
+parser.add_argument('--theta', type=float, default=0.1,
+                    help="loss weight of diffusion")
 
 
 
@@ -124,6 +122,7 @@ print('data ready.')
 
 ### Build lightGCL encoder ###
 tarlist=[5,325,648,761,259,1305,981,364,1450,1601]
+# tarlist=[5,324,787,654,751,1062,935,1086,435,260]
 # tarlist=[5,324,787,654,250,9870,3450,2160,3535,1540]
 encoder = LGCencoder(num_users, num_items, args.encoder_embedding_dim, args.encoder_num_layers).to(device)
 # criterion = LGCencoder.bpr_loss(posuser, pos_item_embeddings, neg_samples).to(device)
@@ -133,8 +132,23 @@ decoder = Decoder(args.encoder_embedding_dim,num_items).to(device)
 # optimizerD = optim.Adam(decoder.parameters(), lr=args.encoder_learning_rate)
 origInter = user_item_interactions[torch.where(user_item_interactions[:, taritemID-1] > 0)[0]].to(device)
 predictor=Predictor(num_users+int(origInter.shape[0]), num_items, args.encoder_embedding_dim, args.encoder_num_layers).to(device)
+if args.mean_type == 'x0':
+    mean_type = gd.ModelMeanType.START_X
+elif args.mean_type == 'eps':
+    mean_type = gd.ModelMeanType.EPSILON
+else:
+    raise ValueError("Unimplemented mean type %s" % args.mean_type)
 
-joinOpti = optim.Adam(list(encoder.parameters())+list(decoder.parameters())+list(predictor.parameters()), lr=args.encoder_learning_rate)
+diffusion = gd.GaussianDiffusion(mean_type, args.noise_schedule, \
+        args.noise_scale, args.noise_min, args.noise_max, args.steps, device).to(device)
+
+### Build Diffusion MLP ###
+out_dims = eval(args.dims) + [args.encoder_embedding_dim]
+# print(out_dims)
+in_dims = out_dims[::-1]
+diffmodel = DNN(in_dims, out_dims, args.emb_size, time_type="cat", norm=args.norm).to(device)
+
+joinOpti = optim.Adam(list(encoder.parameters())+list(decoder.parameters())+list(predictor.parameters())+list(diffmodel.parameters()), lr=args.encoder_learning_rate)
 # 训练encoder
 best_recall = 0
 batch_count = 0
@@ -159,19 +173,28 @@ for epoch in range(args.encoder_num_epochs):
     lossE = encoder.bpr_loss(posuser, pos_item_embeddings, neg_samples)
     # print('LOss',lossE)
 
+    diffmodel.train()
+    losses = diffusion.training_losses(diffmodel, posuser, args.reweight)
+    loss = losses["loss"].mean()
+
     decoder.train()
     out = decoder(posuser)
-    x_round = torch.round(abs(out), decimals=0)
-    lossD = decoder.MAEloss(origInter,x_round)
-    # lossD = decoder.MAEloss(origInter, out)
+    # x_round = torch.round(out, decimals=0)
+    # lossD = decoder.MAEloss(origInter, x_round)
+    lossD = decoder.MAEloss(origInter, out)
     # print('LOss', lossD)
 
+    fakeUser = diffusion.getAttack(diffmodel, posuser, args.sampling_steps, args.sampling_noise).to(device)
+    # fakeUser = torch.tensor(fakeUser, dtype=torch.float32).to(device)
+    out = decoder(fakeUser)
+    # x_round = torch.round(abs(out), decimals=0)
     list1=[]
-    x_round = x_round.cpu()
+    x_round = abs(out).cpu()
     for i in range(x_round.shape[0]):
         for j in range(x_round.shape[1]):
-            if x_round[i][j].item()==1 or j in tarlist:
+            if abs(x_round[i][j].item())>0.15 or j in tarlist:
                 list1.append([num_users+i,num_users+j])
+    print(len(list1))
     edge_index_tar=torch.tensor(list1).t().contiguous().to(device)
     edge_index=edge_index.to(device)
 
@@ -181,7 +204,7 @@ for epoch in range(args.encoder_num_epochs):
 
     predictor.train()
     tarlist_1=[x + num_users for x in tarlist]
-    tarlist_1=torch.tensor(tarlist_1).to(device)
+    # tarlist_1=torch.tensor(tarlist_1).to(device)
     # print('tarlist',tarlist_1)
 
     top_scores = predictor(graph_data_tar, taruser)  # 获取分数 [batch_size, num_items]
@@ -190,159 +213,42 @@ for epoch in range(args.encoder_num_epochs):
     recloss = predictor.RecLoss(top_scores, tarlist)
     # print(recloss)
 
-    joinLoss= args.alpha * lossE + args.beta * lossD + args.gema * recloss
 
-    toplist = predictor.recommend(graph_data_tar, taruser,1000)
+    toplist = predictor.recommend(graph_data_tar, taruser,2000)
     # print('toplist',toplist)
     flattened_toplist = toplist.view(-1)
     counts = [torch.sum(flattened_toplist == value).item() for value in tarlist_1]
     sumcou = sum(counts)
-    recloss = sumcou / len(tarlist * taruser.shape[0])
+    rec = round(sumcou / len(tarlist * taruser.shape[0]),5)
+    print(rec)
 
 
-    if recloss>=best_recall:
-        best_recall=recloss
-        batch_count = 0
-        print(best_recall)
-    else:
-        batch_count+=1
-        if batch_count>2:
+    # if rec>best_recall:
+    #     best_recall=rec
+    #     batch_count = 0
+    #     print("best",best_recall)
+    # else:
+    #     batch_count+=1
+    #     print("rec", rec)
+    #     if batch_count>0:
+    if len(list1)<2000:
+            print("saving")
+            savelist = []
+            for i in range(out.shape[0]):
+                for j in range(out.shape[1]):
+                    if abs(x_round[i][j].item()>0.15) or j in tarlist:
+                        savelist.append([int(num_users)+int(i), j, 1])
+            print(len(savelist))
+            savelist = pandas.DataFrame(savelist)
+            savelist.to_csv('./output/100k/withrec' + str(epoch) + '.txt', index=None, sep='\t',
+                            header=False)
             break
 
-
+    joinLoss = args.alpha * lossE + args.beta * lossD + args.gema * recloss + args.theta * loss
     joinLoss.backward()
     joinOpti.step()
 
     if (epoch + 1) % 10 == 0:
         print(recloss)
         print(f'Epoch [{epoch + 1}/{args.encoder_num_epochs}], Loss: {joinLoss.item():.8f}')
-
-encoder.eval()
-decoder.eval()
-predictor.eval()
-
-savelist1=[]
-with torch.no_grad():
-    # 获取用户和项目的嵌入
-    user_embeddings, item_embeddings = encoder(graph_data)
-
-    # 获取点击279号项目的用户嵌入
-    targetUser = user_embeddings[torch.where(user_item_interactions[:, taritemID-1] > 0)[0]].to(device)
-
-
-### Build Gaussian Diffusion ###
-if args.mean_type == 'x0':
-    mean_type = gd.ModelMeanType.START_X
-elif args.mean_type == 'eps':
-    mean_type = gd.ModelMeanType.EPSILON
-else:
-    raise ValueError("Unimplemented mean type %s" % args.mean_type)
-
-diffusion = gd.GaussianDiffusion(mean_type, args.noise_schedule, \
-        args.noise_scale, args.noise_min, args.noise_max, args.steps, device).to(device)
-
-### Build Diffusion MLP ###
-out_dims = eval(args.dims) + [args.encoder_embedding_dim]
-# print(out_dims)
-in_dims = out_dims[::-1]
-diffmodel = DNN(in_dims, out_dims, args.emb_size, time_type="cat", norm=args.norm).to(device)
-
-optimizer = optim.AdamW(diffmodel.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-print("models ready.")
-
-
-best_recall, best_epoch = -100, 0
-batch_count = 0
-best_test_result = None
-print("Start training...")
-for epoch in range(1, args.epochs + 1):
-
-    diffmodel.train()
-    start_time = time.time()
-
-
-    total_loss = 0.0
-
-    optimizer.zero_grad()
-
-    fakeUser = diffusion.getAttack(diffmodel, targetUser, args.sampling_steps, args.sampling_noise).to(device)
-    # fakeUser = torch.tensor(fakeUser, dtype=torch.float32).to(device)
-    out = decoder(fakeUser)
-    list1 = []
-    x_round = torch.round(abs(out), decimals=0).cpu()
-    for i in range(x_round.shape[0]):
-        for j in range(x_round.shape[1]):
-            if x_round[i][j].item() == 1 or j in tarlist:
-                list1.append([num_users + i, num_users + j])
-    edge_index_tar = torch.tensor(list1).t().contiguous().to(device)
-    edge_index = edge_index.to(device)
-
-    edge_index_tar = torch.concat([edge_index, edge_index_tar], dim=1)
-    graph_data_tar = Data(edge_index=edge_index_tar).to(device)
-
-
-    toplist = predictor.recommend(graph_data_tar, taruser, 1000)
-    flattened_toplist = toplist.view(-1)
-    counts = [torch.sum(flattened_toplist == value).item() for value in tarlist_1]
-    sumcou = sum(counts)
-    recloss = sumcou / len(tarlist * taruser.shape[0])
-    print(recloss)
-
-    if epoch>5:
-        if recloss>=best_recall:
-            best_recall=recloss
-            batch_count = 0
-        else:
-            batch_count+=1
-
-            if batch_count>=2:
-                savelist = []
-                for i in range(out.shape[0]):
-                    for j in range(out.shape[1]):
-                        savelist.append([i, j, round(out[i][j].item(), 3)])
-                savelist = pandas.DataFrame(savelist)
-                savelist.to_csv('./output/100k/withrec' + str(args.encoder_num_epochs) + '.txt', index=None, sep='\t',
-                            header=False)
-                break
-
-
-
-
-    losses = diffusion.training_losses(diffmodel, targetUser, args.reweight)
-    loss = losses["loss"].mean()
-
-    total_loss += loss
-    loss.backward()
-    optimizer.step()
-    if (epoch + 1) % 10 == 0:
-        print(f'Epoch [{epoch + 1}/{args.epochs + 1}], Loss: {loss.item():.8f}')
-    '''
-            torch.save(model, '{}{}_lr{}_wd{}_bs{}_dims{}_emb{}_{}_steps{}_scale{}_min{}_max{}_sample{}_reweight{}_{}.pth' \
-                .format(args.save_path, args.dataset, args.lr, args.weight_decay, args.batch_size, args.dims, args.emb_size, args.mean_type, \
-                args.steps, args.noise_scale, args.noise_min, args.noise_max, args.sampling_steps, args.reweight, args.log_name))
-    
-    '''
-
-
-
-diffmodel.eval()
-
-with torch.no_grad():
-    fakeUser = diffusion.getAttack(diffmodel, targetUser, args.sampling_steps, args.sampling_noise)
-    fakeUser = torch.tensor(fakeUser, dtype=torch.float32).to(device)
-
-savelist=[]
-# decoder.eval()
-with torch.no_grad():
-    out = decoder(fakeUser)
-
-    print(out)
-    print(out.shape)
-    for i in range(out.shape[0]):
-        for j in range(out.shape[1]):
-          savelist.append([i,j,round(out[i][j].item(),3)])
-savelist=pandas.DataFrame(savelist)
-savelist.to_csv('./output/yelp/withrec'+ str(args.encoder_num_epochs) +'.txt',index=None,sep='\t',header=False)
-
-
 print('done')
